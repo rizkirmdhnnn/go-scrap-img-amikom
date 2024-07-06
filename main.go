@@ -2,119 +2,129 @@ package main
 
 import (
 	"fmt"
+	"go-scrap/config"
+	"go-scrap/modules"
 	"golang.org/x/net/proxy"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
-	"os/exec"
-	"strings"
-	"sync"
 	"time"
 )
 
-const torProxy = "socks5://127.0.0.1:9050"
-
-var requestCount int
-var requestCountMutex sync.Mutex
-
-func httpClientWithProxy(url string) (*http.Response, error) {
-	dialer, err := proxy.SOCKS5("tcp", "127.0.0.1:9050", nil, proxy.Direct)
+func newHttpProxy(addr string) (*http.Client, error) {
+	dialer, err := proxy.SOCKS5("tcp", addr, nil, proxy.Direct)
 	if err != nil {
-		return nil, fmt.Errorf("gagal membuat dialer: %v", err)
+		return nil, err
 	}
 	httpClient := &http.Client{
 		Transport: &http.Transport{
 			Dial: dialer.Dial,
 		},
+		Timeout: 15 * time.Second,
 	}
-	return httpClient.Get(url)
+	return httpClient, nil
 }
 
-func downloadImg(url, pathfile string) error {
-	res, err := httpClientWithProxy(url)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		if res.StatusCode == http.StatusNotFound {
-			return nil
+func downloadImage(url string, tor *modules.Tor) (*http.Response, error) {
+	for {
+		httpClient, err := newHttpProxy(config.Cfg.TORSERVER_ADDRESS)
+		if err != nil {
+			log.Fatal(err)
 		}
-		return fmt.Errorf("error response code: %d", res.StatusCode)
+
+		start := time.Now()
+		res, err := httpClient.Get(url)
+		elapsed := time.Since(start)
+
+		if err != nil {
+			if os.IsTimeout(err) || elapsed >= 15*time.Second {
+				fmt.Printf("Request timed out or took too long. Changing IP and retrying...\n")
+				tor.ChangeIP()
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			return nil, err
+		}
+
+		if res.StatusCode != http.StatusOK {
+			if res.StatusCode == http.StatusNotFound {
+				fmt.Println("Image not found")
+			}
+		}
+		return res, nil
 	}
-	filename := url[strings.LastIndex(url, "/")+1:]
-	file, err := os.Create(pathfile + filename)
+}
+
+func saveImage(res *http.Response, filename string) error {
+	if res.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	file, err := os.Create(filename)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 	_, err = io.Copy(file, res.Body)
-	return err
-}
-
-func changeIP() error {
-	conn, err := net.Dial("tcp", "127.0.0.1:9051")
 	if err != nil {
-		return fmt.Errorf("gagal terhubung ke Tor control port: %v", err)
+		return err
 	}
-	defer conn.Close()
-
-	fmt.Fprintf(conn, "AUTHENTICATE \"rizkirmdhn\"\r\n")
-	fmt.Fprintf(conn, "SIGNAL NEWNYM\r\n")
-
-	time.Sleep(3 * time.Second) // Beri waktu untuk Tor membangun sirkuit baru
 	return nil
 }
 
-func getData() {
-	changeIP()
-	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, 50) // Batasi konkurensi menjadi 10
+func getData(jurusan int, tahun int) {
+	tor := modules.NewTor(config.Cfg.TORCONTROL_ADDRESS)
+	tor.Init()
+	tor.ChangeIP()
+	totalRequests := 5000
+	for i := 4880; i < totalRequests; i++ {
+		url := fmt.Sprintf("https://fotomhs.amikom.ac.id/%d/%d_%d_%d.jpg", tahun, tahun%100, jurusan, i)
+		println(url)
 
-	for i := 4000; i <= 6000; i++ {
-		url := fmt.Sprintf("https://fotomhs.amikom.ac.id/2022/22_11_%d.jpg", i)
-		wg.Add(1)
-		semaphore <- struct{}{} // Acquire semaphore
-		go func(url string) {
-			defer wg.Done()
-			defer func() { <-semaphore }() // Release semaphore
+		// Download image (or perform any HTTP request)
+		res, err := downloadImage(url, tor)
+		if err != nil {
+			log.Fatal(err)
+		}
 
-			err := downloadImg(url, "./results/")
-			if err != nil {
-				fmt.Printf("Error downloading %s: %s\n", url, err)
-				return
-			}
-			fmt.Println("Downloaded:", url)
+		// Save the image
+		filename := fmt.Sprintf("./results/image_%d.jpg", i)
+		err = saveImage(res, filename)
+		if err != nil {
+			log.Fatal(err)
+		}
 
-			requestCountMutex.Lock()
-			requestCount++
-			if requestCount%150 == 0 {
-				fmt.Println("Changing IP...")
-				err := changeIP()
-				if err != nil {
-					fmt.Printf("Error changing IP: %v\n", err)
-				}
-			}
-			requestCountMutex.Unlock()
-
-			time.Sleep(1 * time.Second)
-		}(url)
+		// Check if it's time to change IP (every 10 requests, for example)
+		if (i+1)%10 == 0 {
+			fmt.Printf("Changing IP after %d requests\n", i+1)
+			tor.ChangeIP()
+			time.Sleep(5 * time.Second)
+		}
 	}
-	wg.Wait()
-	fmt.Println("All downloads completed")
+}
+
+func menu() {
+	var jurusan int
+	var tahun int
+	fmt.Println("===================")
+	fmt.Println("Informatika (11)")
+	fmt.Println("Sistem Informasi (kambingsun)")
+	fmt.Println("Ilmu Komunikasi (kambingsun)")
+	fmt.Println("===================")
+	fmt.Print("Pilih kode : ")
+	fmt.Scanln(&jurusan)
+	fmt.Println("==== Tahun Angkatan ====")
+	fmt.Println("2020")
+	fmt.Println("2021")
+	fmt.Println("2022")
+	fmt.Println("2023")
+	fmt.Println("=========================")
+	fmt.Print("Pilih Tahun Angkatan : ")
+	fmt.Scanln(&tahun)
+	getData(jurusan, tahun)
 }
 
 func main() {
-	cmd := exec.Command("tor")
-	err := cmd.Start()
-	if err != nil {
-		log.Fatal("Gagal memulai Tor:", err)
-	}
-	defer cmd.Process.Kill()
-
-	time.Sleep(10 * time.Second) // Beri waktu untuk Tor memulai dan membangun sirkuit awal
-
-	getData()
+	config.LoadConfig()
+	menu()
 }
